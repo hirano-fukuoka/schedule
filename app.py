@@ -140,7 +140,7 @@ if sel == "(新規作成)":
         submitted = st.form_submit_button("作成")
         if submitted and name.strip():
             execute("INSERT INTO projects(name, customer, note) VALUES(?,?,?)", (name, customer, note))
-            st.experimental_rerun()
+            st.rerun()
     project_row = None
 else:
     project_row = proj_df.loc[proj_df["name"] == sel].iloc[0]
@@ -182,7 +182,7 @@ project_id = int(project_row["id"])
 if st.sidebar.button("サンプル工程を投入"):
     seed_items(project_id)
     st.success("サンプル工程を投入しました。")
-    st.experimental_rerun()
+    st.rerun()
 
 # ====== アイテム（部品）一覧 ======
 st.subheader("① アイテム（部品）一覧 / 期日設定")
@@ -206,7 +206,7 @@ with st.expander("新規アイテムを追加", expanded=False):
                 VALUES(?,?,?,?,?,?,?)
             """, (project_id, code, desc, plan_start, plan_finish, ksl_due, hard_deadline))
             st.success("アイテムを追加しました。")
-            st.experimental_rerun()
+            st.rerun()
 
 if not items.empty:
     # リスク表示用
@@ -257,7 +257,7 @@ if not items.empty:
                     """, (r["stage"], r["plan_start"], r["plan_finish"], r["act_start"], r["act_finish"],
                           float(r["progress"] or 0.0), r["owner"], r["supplier"], r["memo"], int(r["id"])))
             st.success("保存しました。")
-            st.experimental_rerun()
+            st.rerun()
 else:
     st.stop()
 
@@ -339,7 +339,7 @@ with col1:
                   r.get("act_start"), r.get("act_finish"), float(r.get("progress", 0) or 0),
                   r.get("owner"), r.get("supplier"), r.get("memo")))
         st.success("CSVを取り込みました。")
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     exp_items = df_from_sql("SELECT * FROM items WHERE project_id=?", (project_id,))
