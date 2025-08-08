@@ -21,7 +21,7 @@ st.markdown("""
 # ====== 一般化設定（固有名詞を使わない） ======
 CONFIG = {
     "FIELD_LABELS": {
-        "customer_due": "顧客納期",     # 旧: KSL納期
+        "customer_due": "顧客納期",     # 旧: 納期
         "internal_deadline": "社内締切" # 旧: デッドライン
     },
     "DEFAULT_PROJECT_NAME": "",          # 固有名詞の自動入力はしない
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS items(
     description TEXT,
     plan_start DATE,
     plan_finish DATE,
-    ksl_due DATE,
+    due DATE,
     hard_deadline DATE,
     UNIQUE(project_id, code)
 );
@@ -101,7 +101,7 @@ def risk_level(row: pd.Series) -> str:
     else:
         est_finish = plan_finish
 
-    due_candidates = [d for d in [row.get("ksl_due"), row.get("hard_deadline"), plan_finish] if pd.notna(d)]
+    due_candidates = [d for d in [row.get("due"), row.get("hard_deadline"), plan_finish] if pd.notna(d)]
     due = min(pd.to_datetime(x) for x in due_candidates) if due_candidates else None
 
     if not due or not est_finish:
@@ -125,7 +125,7 @@ def badge(level: str) -> str:
 
 def df_from_sql(sql, params=()):
     with closing(get_conn()) as con:
-        return pd.read_sql_query(sql, con, params=params, parse_dates=["plan_start","plan_finish","act_start","act_finish","ksl_due","hard_deadline"])
+        return pd.read_sql_query(sql, con, params=params, parse_dates=["plan_start","plan_finish","act_start","act_finish","due","hard_deadline"])
 
 def execute(sql, params=()):
     with closing(get_conn()) as con, con:
@@ -197,14 +197,14 @@ with st.expander("新規アイテムを追加", expanded=False):
             plan_start = st.date_input("計画開始日", value=date.today())
             plan_finish = st.date_input("計画完了日", value=date.today()+timedelta(days=30))
         with col3:
-            ksl_due = st.date_input(f'{CONFIG["FIELD_LABELS"]["customer_due"]}（任意）', value=None)
+            due = st.date_input(f'{CONFIG["FIELD_LABELS"]["customer_due"]}（任意）', value=None)
             hard_deadline = st.date_input(f'{CONFIG["FIELD_LABELS"]["internal_deadline"]}（任意）', value=None)
         submitted = st.form_submit_button("追加")
         if submitted and code.strip():
             execute("""
-                INSERT OR IGNORE INTO items(project_id, code, description, plan_start, plan_finish, ksl_due, hard_deadline)
+                INSERT OR IGNORE INTO items(project_id, code, description, plan_start, plan_finish, due, hard_deadline)
                 VALUES(?,?,?,?,?,?,?)
-            """, (project_id, code.strip(), desc, plan_start, plan_finish, ksl_due, hard_deadline))
+            """, (project_id, code.strip(), desc, plan_start, plan_finish, due, hard_deadline))
             st.success("アイテムを追加しました。")
             st.rerun()
 
@@ -215,7 +215,7 @@ else:
     items_view["risk"] = items_view.apply(risk_level, axis=1)
     items_view["状態"] = items_view["risk"].map({"late":"遅延","warn":"要注意","ok":"順調"})
 
-    edit_df = items[["id","code","description","plan_start","plan_finish","ksl_due","hard_deadline"]].copy()
+    edit_df = items[["id","code","description","plan_start","plan_finish","due","hard_deadline"]].copy()
     edit_df["削除"] = False
 
     with st.form("edit_items"):
@@ -226,7 +226,7 @@ else:
                 "description": st.column_config.TextColumn("説明"),
                 "plan_start": st.column_config.DateColumn("計画開始日"),
                 "plan_finish": st.column_config.DateColumn("計画完了日"),
-                "ksl_due": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["customer_due"]),
+                "due": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["customer_due"]),
                 "hard_deadline": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["internal_deadline"]),
                 "削除": st.column_config.CheckboxColumn("削除")
             },
@@ -255,7 +255,7 @@ else:
                                description=?,
                                plan_start=?,
                                plan_finish=?,
-                               ksl_due=?,
+                               due=?,
                                hard_deadline=?
                          WHERE id=?
                     """, (
@@ -263,7 +263,7 @@ else:
                         r.get("description") or "",
                         _d(r.get("plan_start")),
                         _d(r.get("plan_finish")),
-                        _d(r.get("ksl_due")),
+                        _d(r.get("due")),
                         _d(r.get("hard_deadline")),
                         iid
                     ))
@@ -273,9 +273,9 @@ else:
             st.rerun()
 
     st.markdown("**状態ビュー（読み取り）**")
-    display = items_view[["code","plan_start","plan_finish","ksl_due","hard_deadline","状態"]].rename(columns={
+    display = items_view[["code","plan_start","plan_finish","due","hard_deadline","状態"]].rename(columns={
         "code":"アイテム",
-        "ksl_due": CONFIG["FIELD_LABELS"]["customer_due"],
+        "due": CONFIG["FIELD_LABELS"]["customer_due"],
         "hard_deadline": CONFIG["FIELD_LABELS"]["internal_deadline"]
     })
     st.write(display.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -457,10 +457,10 @@ if alert.empty:
 else:
     alert["badge"] = alert["risk"].map(badge)
     show = alert.sort_values("risk").assign(アイテム=alert["code"])[
-        ["badge","アイテム","plan_finish","ksl_due","hard_deadline","progress"]
+        ["badge","アイテム","plan_finish","due","hard_deadline","progress"]
     ].rename(columns={
         "plan_finish":"計画完了",
-        "ksl_due": CONFIG["FIELD_LABELS"]["customer_due"],
+        "due": CONFIG["FIELD_LABELS"]["customer_due"],
         "hard_deadline": CONFIG["FIELD_LABELS"]["internal_deadline"],
         "progress":"進捗率"
     })
