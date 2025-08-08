@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from contextlib import closing
 
 import pandas as pd
@@ -21,17 +21,27 @@ st.markdown("""
 # ====== 一般化設定（固有名詞を使わない） ======
 CONFIG = {
     "FIELD_LABELS": {
-        "customer_due": "顧客納期",     # 旧: 納期
-        "internal_deadline": "社内締切" # 旧: デッドライン
+        "customer_due": "顧客納期",     # UI表示用ラベル（DB列名とは切り離し）
+        "internal_deadline": "社内締切"
     },
-    "DEFAULT_PROJECT_NAME": "",          # 固有名詞の自動入力はしない
+    "DEFAULT_PROJECT_NAME": "",
     "DEFAULT_CUSTOMER_NAME": "",
-    "DEFAULT_ITEMS": []                  # 固有名詞の部品サンプルは投入しない
+    "DEFAULT_ITEMS": []  # 初期サンプルは投入しない
 }
 
-# ====== 定数 ======
+# ====== 定数（ステージ拡張版） ======
 DEFAULT_STAGES = [
-    "設計", "材料手配", "前加工", "製缶", "仕上加工", "購入部品", "組立", "検査", "試運転", "解体", "出荷"
+    "設計",
+    "材料手配",
+    "前加工",
+    "製缶",
+    "仕上加工",
+    "購入部品",
+    "組立",
+    "検査",
+    "試運転",
+    "解体",
+    "出荷",
 ]
 
 DB_PATH = "progress.db"
@@ -47,6 +57,7 @@ CREATE TABLE IF NOT EXISTS projects(
     note TEXT
 );
 
+-- 既存テーブルがある場合は何もしない（列名の差異はアプリ側で吸収）
 CREATE TABLE IF NOT EXISTS items(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -54,8 +65,8 @@ CREATE TABLE IF NOT EXISTS items(
     description TEXT,
     plan_start DATE,
     plan_finish DATE,
-    due DATE,
-    hard_deadline DATE,
+    due DATE,               -- 顧客納期（既存DBが ksl_due のこともある）
+    hard_deadline DATE,     -- 社内締切
     UNIQUE(project_id, code)
 );
 
@@ -85,31 +96,70 @@ def init_db():
 
 init_db()
 
+# ====== 互換レイヤ（due / ksl_due のどちらでも動く） ======
+def resolve_due_column() -> str:
+    """itemsテーブルで『顧客納期』に相当する実カラム名（due or ksl_due）を検出。"""
+    with closing(get_conn()) as con:
+        cols = pd.read_sql_query("PRAGMA table_info(items);", con)["name"].tolist()
+    if "due" in cols:
+        return "due"
+    if "ksl_due" in cols:
+        return "ksl_due"
+    # どちらも無ければアプリ内では仮想列で扱い、保存時はNULLになる（後でALTERしてもOK）
+    return "due"
+
+DUE_COL = resolve_due_column()
+
+def normalize_item_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """UI用の仮想列 due_ui を作成。DBの列名ゆらぎを吸収。"""
+    df = df.copy()
+    if "due_ui" not in df.columns:
+        if DUE_COL in df.columns:
+            df["due_ui"] = df[DUE_COL]
+        elif "ksl_due" in df.columns:
+            df["due_ui"] = df["ksl_due"]
+        else:
+            df["due_ui"] = pd.NaT
+    return df
+
 # ====== ユーティリティ ======
+def df_from_sql(sql, params=()):
+    parse_cols = ["plan_start","plan_finish","act_start","act_finish","hard_deadline","due","ksl_due"]
+    with closing(get_conn()) as con:
+        return pd.read_sql_query(sql, con, params=params, parse_dates=parse_cols)
+
+def execute(sql, params=()):
+    with closing(get_conn()) as con, con:
+        con.execute(sql, params)
+
 def risk_level(row: pd.Series) -> str:
+    """予定・実績・期日から遅延リスクを判定。"""
     today = date.today()
     plan_finish = row.get("plan_finish")
     act_finish = row.get("act_finish")
     progress = float(row.get("progress") or 0.0)
 
-    if progress > 0 and progress < 1 and plan_finish:
+    # 推定完了日
+    if progress > 0 and progress < 1 and pd.notna(plan_finish):
         plan_start = row.get("plan_start") or today
         plan_days = max((pd.to_datetime(plan_finish) - pd.to_datetime(plan_start)).days, 1)
-        est_finish = today + timedelta(days=int(plan_days * (1 - progress)))
+        est_finish = pd.to_datetime(today + timedelta(days=int(plan_days * (1 - progress))))
     elif progress >= 1:
-        est_finish = act_finish or plan_finish
+        est_finish = pd.to_datetime(act_finish or plan_finish)
     else:
-        est_finish = plan_finish
+        est_finish = pd.to_datetime(plan_finish) if pd.notna(plan_finish) else None
 
-    due_candidates = [d for d in [row.get("due"), row.get("hard_deadline"), plan_finish] if pd.notna(d)]
+    # 期日（顧客納期・社内締切・計画完了のうち最も厳しいもの）
+    due_candidates = []
+    for k in ["due_ui", "due", "ksl_due", "hard_deadline", "plan_finish"]:
+        if k in row and pd.notna(row.get(k)):
+            due_candidates.append(row.get(k))
     due = min(pd.to_datetime(x) for x in due_candidates) if due_candidates else None
 
     if not due or not est_finish:
         return "warn"
 
-    est_finish = pd.to_datetime(est_finish)
-    slack_days = (due - est_finish).days
-
+    slack_days = (pd.to_datetime(due) - pd.to_datetime(est_finish)).days
     if slack_days < 0:
         return "late"
     elif slack_days <= 7:
@@ -123,13 +173,14 @@ def badge(level: str) -> str:
         "ok":   '<span class="ok">順調</span>',
     }.get(level, '<span class="warn">要確認</span>')
 
-def df_from_sql(sql, params=()):
-    with closing(get_conn()) as con:
-        return pd.read_sql_query(sql, con, params=params, parse_dates=["plan_start","plan_finish","act_start","act_finish","due","hard_deadline"])
-
-def execute(sql, params=()):
-    with closing(get_conn()) as con, con:
-        con.execute(sql, params)
+def date_input_nullable(label: str, key: str):
+    """日付を未設定にできる入力UI（一部バージョンの value=None 問題対策）。"""
+    c1, c2 = st.columns([4,1])
+    with c1:
+        d = st.date_input(label, value=date.today(), key=f"{key}_date")
+    with c2:
+        clear = st.checkbox("未設定", key=f"{key}_clear", value=True)
+    return None if clear else d
 
 # ====== サイドバー ======
 st.sidebar.header("プロジェクト")
@@ -151,7 +202,7 @@ else:
     project_row = proj_df.loc[proj_df["name"] == sel].iloc[0]
     st.sidebar.caption(f"客先: {project_row['customer']}")
 
-# ====== 初期データ投入 ======
+# ====== 初期データ投入（未使用） ======
 def seed_items(project_id: int):
     if not CONFIG["DEFAULT_ITEMS"]:
         return
@@ -182,10 +233,11 @@ if st.sidebar.button("サンプル工程を投入"):
     st.success("サンプル工程を投入しました。")
     st.rerun()
 
-# ====== アイテム一覧（編集・削除対応） ======
+# ====== ① アイテム（部品）一覧 / 期日設定（編集・削除対応） ======
 st.subheader("① アイテム（部品）一覧 / 期日設定")
 
 items = df_from_sql("SELECT * FROM items WHERE project_id=? ORDER BY id", (project_id,))
+items = normalize_item_columns(items)
 
 with st.expander("新規アイテムを追加", expanded=False):
     with st.form("add_item"):
@@ -197,25 +249,28 @@ with st.expander("新規アイテムを追加", expanded=False):
             plan_start = st.date_input("計画開始日", value=date.today())
             plan_finish = st.date_input("計画完了日", value=date.today()+timedelta(days=30))
         with col3:
-            due = st.date_input(f'{CONFIG["FIELD_LABELS"]["customer_due"]}（任意）', value=None)
-            hard_deadline = st.date_input(f'{CONFIG["FIELD_LABELS"]["internal_deadline"]}（任意）', value=None)
+            due_ui = date_input_nullable(CONFIG["FIELD_LABELS"]["customer_due"]+"（任意）", "add_due")
+            hard_deadline = date_input_nullable(CONFIG["FIELD_LABELS"]["internal_deadline"]+"（任意）", "add_hd")
         submitted = st.form_submit_button("追加")
         if submitted and code.strip():
-            execute("""
-                INSERT OR IGNORE INTO items(project_id, code, description, plan_start, plan_finish, due, hard_deadline)
+            # DUE_COL に書き込む（due / ksl_due のどちらでも）
+            execute(f"""
+                INSERT OR IGNORE INTO items(project_id, code, description, plan_start, plan_finish, {DUE_COL}, hard_deadline)
                 VALUES(?,?,?,?,?,?,?)
-            """, (project_id, code.strip(), desc, plan_start, plan_finish, due, hard_deadline))
+            """, (project_id, code.strip(), desc, plan_start, plan_finish, due_ui, hard_deadline))
             st.success("アイテムを追加しました。")
             st.rerun()
 
 if items.empty:
     st.warning("アイテムが未登録です。")
 else:
+    # 状態判定用に due_ui を渡す
     items_view = items.copy()
     items_view["risk"] = items_view.apply(risk_level, axis=1)
     items_view["状態"] = items_view["risk"].map({"late":"遅延","warn":"要注意","ok":"順調"})
 
-    edit_df = items[["id","code","description","plan_start","plan_finish","due","hard_deadline"]].copy()
+    # 編集用DF（仮想列 due_ui を編集対象にする）
+    edit_df = items[["id","code","description","plan_start","plan_finish","due_ui","hard_deadline"]].copy()
     edit_df["削除"] = False
 
     with st.form("edit_items"):
@@ -226,7 +281,7 @@ else:
                 "description": st.column_config.TextColumn("説明"),
                 "plan_start": st.column_config.DateColumn("計画開始日"),
                 "plan_finish": st.column_config.DateColumn("計画完了日"),
-                "due": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["customer_due"]),
+                "due_ui": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["customer_due"]),
                 "hard_deadline": st.column_config.DateColumn(CONFIG["FIELD_LABELS"]["internal_deadline"]),
                 "削除": st.column_config.CheckboxColumn("削除")
             },
@@ -249,13 +304,14 @@ else:
                             con.execute("DELETE FROM items WHERE id=?", (iid,))
                             deleted += 1
                         continue
-                    con.execute("""
+                    # 実在カラム（DUE_COL）に due_ui を書き戻す
+                    con.execute(f"""
                         UPDATE items
                            SET code=?,
                                description=?,
                                plan_start=?,
                                plan_finish=?,
-                               due=?,
+                               {DUE_COL}=?,
                                hard_deadline=?
                          WHERE id=?
                     """, (
@@ -263,7 +319,7 @@ else:
                         r.get("description") or "",
                         _d(r.get("plan_start")),
                         _d(r.get("plan_finish")),
-                        _d(r.get("due")),
+                        _d(r.get("due_ui")),
                         _d(r.get("hard_deadline")),
                         iid
                     ))
@@ -273,9 +329,9 @@ else:
             st.rerun()
 
     st.markdown("**状態ビュー（読み取り）**")
-    display = items_view[["code","plan_start","plan_finish","due","hard_deadline","状態"]].rename(columns={
+    display = items_view[["code","plan_start","plan_finish","due_ui","hard_deadline","状態"]].rename(columns={
         "code":"アイテム",
-        "due": CONFIG["FIELD_LABELS"]["customer_due"],
+        "due_ui": CONFIG["FIELD_LABELS"]["customer_due"],
         "hard_deadline": CONFIG["FIELD_LABELS"]["internal_deadline"]
     })
     st.write(display.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -284,6 +340,7 @@ else:
 st.subheader("② タスク（工程）編集")
 
 items_for_tasks = df_from_sql("SELECT * FROM items WHERE project_id=? ORDER BY id", (project_id,))
+items_for_tasks = normalize_item_columns(items_for_tasks)
 if items_for_tasks.empty:
     st.info("先に『① アイテム一覧』でアイテムを作成してください。")
     st.stop()
@@ -294,7 +351,6 @@ item_id = int(items_for_tasks.loc[items_for_tasks["code"] == sel_item].iloc[0]["
 tasks = df_from_sql("SELECT * FROM tasks WHERE item_id=? ORDER BY id", (item_id,))
 with st.form("edit_tasks"):
     st.caption("行を編集して『保存』を押してください。新規行を追加することもできます。削除はチェック＋下部の確認で実行。")
-    # 編集用テーブルを準備
     task_df = tasks.copy()
     task_df["削除"] = False
 
@@ -311,7 +367,7 @@ with st.form("edit_tasks"):
             "supplier": st.column_config.TextColumn("外注/購買先"),
             "memo": st.column_config.TextColumn("メモ"),
             "削除": st.column_config.CheckboxColumn("削除"),
-            "id": None, "item_id": None  # 非表示
+            "id": None, "item_id": None
         },
         hide_index=True,
         use_container_width=True,
@@ -327,11 +383,9 @@ with st.form("edit_tasks"):
         inserted, updated, deleted, failed = 0, 0, 0, 0
         with closing(get_conn()) as con, con:
             for _, r in edited.iterrows():
-                # 既存行か新規行か
                 row_id = r.get("id")
                 is_new = pd.isna(row_id) or row_id is None
 
-                # 削除チェック
                 if not is_new and bool(r.get("削除")):
                     if confirm_delete_task:
                         try:
@@ -341,7 +395,6 @@ with st.form("edit_tasks"):
                             failed += 1
                     continue
 
-                # 空行（ステージ無し/計画無しなど）はスキップ
                 stage = (r.get("stage") or "").strip()
                 if stage == "":
                     continue
@@ -391,6 +444,23 @@ with st.form("edit_tasks"):
         if failed: st.warning(f"失敗 {failed} 件（入力内容を確認してください）")
         st.rerun()
 
+# 既存アイテムに不足ステージを補完（任意で使う）
+st.markdown("---")
+if st.button("選択アイテムに足りないステージを補完する"):
+    existing = set(tasks["stage"].dropna().astype(str).tolist())
+    missing = [s for s in DEFAULT_STAGES if s not in existing]
+    if not missing:
+        st.info("補完対象のステージはありません。")
+    else:
+        with closing(get_conn()) as con, con:
+            for s in missing:
+                con.execute("""
+                    INSERT INTO tasks(item_id, stage, plan_start, plan_finish, act_start, act_finish, progress, owner, supplier, memo)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                """, (item_id, s, None, None, None, None, 0.0, "", "", "補完追加"))
+        st.success(f"補完したステージ: {', '.join(missing)}")
+        st.rerun()
+
 # ====== ③ ガントチャート（予定 / 実績） ======
 st.subheader("③ ガントチャート（予定 / 実績）")
 
@@ -438,16 +508,19 @@ st.subheader("④ 遅延アラート")
 alert_rows = []
 for _, it in items_for_tasks.iterrows():
     tdf = df_from_sql("SELECT * FROM tasks WHERE item_id=? ORDER BY id", (int(it["id"]),))
-    if tdf.empty:
+    tdf_nonnull = tdf.dropna(subset=["plan_finish"])
+    if tdf_nonnull.empty:
         continue
-    # 代表タスクは計画完了が最も遅いもの（全体完了に近い）
-    rep = tdf.sort_values("plan_finish").iloc[-1]
+    # 代表タスク：計画完了が最も遅いもの（全体完了に近い）
+    rep = tdf_nonnull.sort_values("plan_finish").iloc[-1]
     row = {**it.to_dict(),
            "plan_start": rep.get("plan_start"),
            "plan_finish": rep.get("plan_finish"),
            "act_start": rep.get("act_start"),
            "act_finish": rep.get("act_finish"),
            "progress": rep.get("progress")}
+    # due_ui を渡してリスク判定
+    row["due_ui"] = it.get("due_ui")
     row["risk"] = risk_level(pd.Series(row))
     alert_rows.append(row)
 
@@ -457,10 +530,10 @@ if alert.empty:
 else:
     alert["badge"] = alert["risk"].map(badge)
     show = alert.sort_values("risk").assign(アイテム=alert["code"])[
-        ["badge","アイテム","plan_finish","due","hard_deadline","progress"]
+        ["badge","アイテム","plan_finish","due_ui","hard_deadline","progress"]
     ].rename(columns={
         "plan_finish":"計画完了",
-        "due": CONFIG["FIELD_LABELS"]["customer_due"],
+        "due_ui": CONFIG["FIELD_LABELS"]["customer_due"],
         "hard_deadline": CONFIG["FIELD_LABELS"]["internal_deadline"],
         "progress":"進捗率"
     })
@@ -524,7 +597,14 @@ with col_up:
             st.error(f"取り込みに失敗しました: {e}")
 
 with col_down:
+    # items出力：実在カラム名（DUE_COL）で出す（閲覧用に due_ui も付ける）
     exp_items = df_from_sql("SELECT * FROM items WHERE project_id=?", (project_id,))
+    exp_items = normalize_item_columns(exp_items)
+    if DUE_COL not in exp_items.columns:
+        exp_items[DUE_COL] = pd.NaT
+    exp_items_ordered = exp_items[["id","project_id","code","description","plan_start","plan_finish",DUE_COL,"hard_deadline","due_ui"]]
+    st.download_button("アイテム一覧をCSVで出力", data=exp_items_ordered.to_csv(index=False), file_name="items.csv", mime="text/csv")
+
     exp_tasks = df_from_sql("""
         SELECT i.code AS item_code, t.*
           FROM tasks t
@@ -532,7 +612,6 @@ with col_down:
          WHERE i.project_id=?
          ORDER BY i.code, t.id
     """, (project_id,))
-    st.download_button("アイテム一覧をCSVで出力", data=exp_items.to_csv(index=False), file_name="items.csv", mime="text/csv")
     st.download_button("タスク一覧をCSVで出力", data=exp_tasks.to_csv(index=False), file_name="tasks.csv", mime="text/csv")
 
-st.caption("※ 背景は常に白で表示。顧客納期/社内締切を設定すると、逆算で『順調/要注意/遅延』を自動判定します。")
+st.caption("※ 背景は常に白で表示。顧客納期/社内締切（列名が due でも ksl_due でもOK）を設定すると、逆算で『順調/要注意/遅延』を自動判定します。")
